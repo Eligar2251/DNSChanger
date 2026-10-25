@@ -277,7 +277,39 @@ def run_gui(args) -> int:  # noqa: C901 - здесь вся сборка при�
 # --------------------------------------------------------------------------- #
 
 
+def _cli_flags(argv: list[str]) -> bool:
+    """Переданы ли консольные команды (а не только флаги интерфейса)."""
+    flags = ("--status", "--recover", "--lock", "--selftest", "--version", "-h", "--help")
+    return any(a.startswith(flags) for a in argv)
+
+
+def _attach_console() -> None:
+    """Сборка --windowed: консольным командам нужен stdout.
+
+    Без этого ``VaultKeeper.exe --status`` в оконной сборке молчал бы:
+    у процессов без консоли sys.stdout равен None.
+    """
+    if sys.platform != "win32":
+        return
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    try:
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        if not kernel32.AttachConsole(-1):  # консоль родителя (cmd/powershell)
+            kernel32.AllocConsole()
+        sys.stdout = open("CONOUT$", "w", encoding="utf-8", errors="replace")  # noqa: SIM115
+        sys.stderr = open("CONOUT$", "w", encoding="utf-8", errors="replace")  # noqa: SIM115
+        sys.stdin = open("CONIN$", "r", encoding="utf-8", errors="replace")  # noqa: SIM115
+    except Exception:  # noqa: BLE001 — консоли нет: работаем молча
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if _cli_flags(argv):
+        _attach_console()
     args = build_parser().parse_args(argv)
 
     if args.version:
