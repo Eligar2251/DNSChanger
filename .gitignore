@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Артефакты сборки и превью
+dist/
+build_out/
+out/
+build/app_icon.ico
+build/app_icon.png
+*.spec.bak
+
+# ОС/редакторы
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

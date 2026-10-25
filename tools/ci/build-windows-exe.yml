@@ -1,0 +1,65 @@
+name: build-windows-exe
+
+on:
+  push:
+    branches: [main, "arena/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Зависимости
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller pillow
+
+      - name: Самопроверка ядра
+        run: python -m vaultkeeper --selftest
+
+      - name: Иконка
+        run: python build/make_icon.py
+
+      - name: Сборка VaultKeeper.exe
+        run: python build/build_exe.py
+
+      - name: exe запускается и отвечает на --version
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist\VaultKeeper.exe")) { throw "нет dist\VaultKeeper.exe" }
+          $p = Start-Process -FilePath "dist\VaultKeeper.exe" -ArgumentList "--version" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "VaultKeeper.exe --version вернул $($p.ExitCode)" }
+          Get-Item "dist\VaultKeeper.exe" | Select-Object Name, Length
+
+      - name: Артефакт
+        uses: actions/upload-artifact@v4
+        with:
+          name: VaultKeeper-exe
+          path: dist/VaultKeeper.exe
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Публикация в релиз exe-latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release view exe-latest --repo $env:GITHUB_REPOSITORY | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create exe-latest "dist\VaultKeeper.exe" `
+              --title "VaultKeeper.exe (автосборка)" `
+              --notes "Сборка с ветки $env:GITHUB_REF_NAME, коммит $env:GITHUB_SHA. Скачайте VaultKeeper.exe и запустите." `
+              --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA
+          } else {
+            gh release upload exe-latest "dist\VaultKeeper.exe" --clobber --repo $env:GITHUB_REPOSITORY
+          }
