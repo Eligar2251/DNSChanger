@@ -86,6 +86,9 @@ def cmd_status(root: Path) -> int:
     print(f"Аварийный ключ (DPAPI)        : {'сохранён' if vault.emergency_available else 'нет'}")
     blobs = list(vault.blobs_dir.glob('*.vkb')) if vault.blobs_dir.exists() else []
     print(f"Зашифрованных блоков          : {len(blobs)} ({human_size(sum(b.stat().st_size for b in blobs))})")
+    staged = vault.staged_count()
+    if staged:
+        print(f"В скрытом буфере (зашифруются при открытии): {staged}")
     interrupted = vault.interrupted_operation()
     if interrupted:
         print(f"ВНИМАНИЕ: незавершённая операция {interrupted.get('op')} / {interrupted.get('phase')}")

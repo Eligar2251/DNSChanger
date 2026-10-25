@@ -184,3 +184,116 @@ def test_folder_card_actions_signal(qapp, controller):
     _pump(qapp)
     assert card.buttons.count() >= 2
     card.close()
+
+
+# ------------------------------------------------------------------ #
+# Наблюдатель: брошенный в папку файл прячется сам
+# ------------------------------------------------------------------ #
+
+
+def _sync_run(ctrl, monkeypatch) -> list[str]:
+    """_run без потоков: задача выполняется сразу, ошибки копятся в список."""
+    errors: list[str] = []
+
+    def fake_run(task, message="", on_ok=None, on_err=None):
+        try:
+            result = task(lambda *a: None)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(str(exc))
+            if on_err is not None:
+                on_err(str(exc))
+            return
+        if on_ok is not None:
+            on_ok(result)
+
+    monkeypatch.setattr(ctrl, "_run", fake_run)
+    return errors
+
+
+def test_watcher_hides_dropped_file_when_key_in_ram(qapp, controller, monkeypatch, tmp_path: Path):
+    errors = _sync_run(controller, monkeypatch)
+    vault = controller.vault
+
+    assert vault.unlock(PASSWORD).authenticated
+    vault.unlock_all()
+    vault.lock_all(keep_folder_visible=False)  # папка убрана, но ключ остался в памяти
+    controller.state = STATE_LOCKED
+    controller.settings.instant_protection = True
+
+    folder = Path(vault.manifest.folders[0].path)
+    assert not folder.exists()
+    folder.mkdir(parents=True, exist_ok=True)
+    dropped = folder / "брошено.txt"
+    dropped.write_bytes(b"payload-data" * 20)
+
+    controller._watch_tick()  # первый тик: запоминаем размер, файл ещё копируется
+    assert dropped.exists()
+    controller._watch_tick()  # размер стабилен → прячем
+    assert errors == []
+    assert not dropped.exists()
+    assert not folder.exists()  # папка снова убрана целиком
+    vault.forget_keys()
+
+
+def test_watcher_stages_dropped_file_without_key(qapp, controller, monkeypatch, tmp_path: Path):
+    errors = _sync_run(controller, monkeypatch)
+    vault = controller.vault
+    vault.forget_keys()  # ключа в памяти нет
+    controller.state = STATE_LOCKED
+    controller.settings.instant_protection = False
+
+    view = vault.decoy_view.load()
+    assert view and view[0].folder_id
+    folder = Path(view[0].path)
+    folder.mkdir(parents=True, exist_ok=True)
+    payload = b"jpeg" * 50
+    dropped = folder / "снимок.jpg"
+    dropped.write_bytes(payload)
+
+    controller._watch_tick()
+    controller._watch_tick()
+    assert errors == []
+    assert not dropped.exists()
+    assert vault.staged_count() == 1
+
+    assert vault.unlock(PASSWORD).authenticated
+    assert vault.ingest_staged() == 1
+    vault.unlock_all()
+    assert (folder / "снимок.jpg").read_bytes() == payload
+    vault.forget_keys()
+
+
+def test_watcher_ignores_unlocked_state(qapp, controller, monkeypatch, tmp_path: Path):
+    """Пока сейф открыт, файлы пользователя трогать нельзя."""
+    _sync_run(controller, monkeypatch)
+    vault = controller.vault
+    assert vault.unlock(PASSWORD).authenticated
+    vault.unlock_all()
+    controller.state = STATE_UNLOCKED
+
+    folder = Path(vault.manifest.folders[0].path)
+    working = folder / "работаю.txt"
+    working.write_bytes(b"do-not-touch")
+
+    controller._watch_tick()
+    controller._watch_tick()
+    assert working.read_bytes() == b"do-not-touch"
+    vault.forget_keys()
+
+
+def test_settings_visibility_toggles(qapp, controller):
+    from vaultkeeper.ui.window import MainWindow
+
+    window = MainWindow(controller, controller.settings)
+    page = window.settings_page
+    data = page.collect()
+    assert "hide_folders_when_locked" in data
+    assert "instant_protection" in data
+    assert data["hide_folders_when_locked"] is True
+
+    page.t_instant.setChecked(False)
+    page.t_hide_folders.setChecked(False)
+    data = page.collect()
+    assert data["instant_protection"] is False
+    assert data["hide_folders_when_locked"] is False
+    window.close()

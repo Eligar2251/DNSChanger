@@ -491,6 +491,21 @@ class SettingsPage(ScrollPage):
         wipe_card.layout_.insertLayout(0, wipe_head)
         self.add(wipe_card)
 
+        self.t_hide_folders = self._toggle(
+            "Полностью убирать папки, когда всё заблокировано",
+            "Папки не будет ни в проводнике, ни в диалоге «добавить файл» браузера — "
+            "даже с показом скрытых элементов. Приманки появляются только если "
+            "кто-то введёт пароль (сеанс обманки).",
+            settings.hide_folders_when_locked,
+        )
+        self.t_instant = self._toggle(
+            "Мгновенно прятать новые файлы",
+            "Пока приложение работает в трее, брошенный в защищённую папку файл "
+            "исчезает через пару секунд. Если выключить — файл уносится в скрытый "
+            "буфер и шифруется при следующем открытии сейфа.",
+            settings.instant_protection,
+        )
+
         # ---- Следы ---- #
         self.add(SectionLabel("Следы в Windows"))
         self.t_traces = self._toggle(
@@ -630,6 +645,8 @@ class SettingsPage(ScrollPage):
             "lock_on_window_close": self.t_lock_close.isChecked(),
             "deep_verify": self.t_deep.isChecked(),
             "hide_vault_files": self.t_hide.isChecked(),
+            "hide_folders_when_locked": self.t_hide_folders.isChecked(),
+            "instant_protection": self.t_instant.isChecked(),
             "purge_traces": self.t_traces.isChecked(),
             "disable_quick_access_lists": self.t_quick.isChecked(),
             "clean_thumbnails": self.t_thumbs.isChecked(),

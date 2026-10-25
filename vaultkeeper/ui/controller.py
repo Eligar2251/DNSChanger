@@ -135,6 +135,7 @@ class VaultController(QObject):
         self.last_error: str = ""
         self._thread: TaskThread | None = None
         self._busy = False
+        self._stopping = False
         self._last_activity = time.time()
         self._autolock_timer = QTimer(self)
         self._autolock_timer.setInterval(15_000)
@@ -143,6 +144,13 @@ class VaultController(QObject):
         self._clock_timer = QTimer(self)
         self._clock_timer.setInterval(20_000)
         self._clock_timer.timeout.connect(self._tick)
+
+        # наблюдатель: бросили файл в защищённую папку — прячем сразу
+        self._watch_timer = QTimer(self)
+        self._watch_timer.setInterval(2000)
+        self._watch_timer.timeout.connect(self._watch_tick)
+        self._watch_timer.start()
+        self._watch_seen: dict[str, dict[str, int]] = {}
 
     # ==================================================================== #
     # Запуск
@@ -178,6 +186,20 @@ class VaultController(QObject):
 
     def shutdown(self, lock: bool | None = None) -> None:
         """Корректный выход: по умолчанию блокируем всё и чистим ключи."""
+        # сначала гасим таймеры: тик во время завершения процесса запустил бы
+        # фоновую задачу и подвесил выход
+        self._stopping = True
+        for timer in (
+            getattr(self, "_watch_timer", None),
+            getattr(self, "_autolock_timer", None),
+            getattr(self, "_clock_timer", None),
+        ):
+            if timer is not None:
+                try:
+                    timer.stop()
+                except RuntimeError:  # C++-объект уже удалён
+                    pass
+
         should_lock = self.settings.lock_on_window_close if lock is None else lock
         if should_lock and self.vault is not None and self.vault.unlocked and not self.decoy_mode:
             try:
@@ -185,6 +207,7 @@ class VaultController(QObject):
                     purge_traces=self.settings.purge_traces,
                     verify_deep=self.settings.deep_verify,
                     wipe_passes=self.settings.wipe_passes,
+                    keep_folder_visible=not self.settings.hide_folders_when_locked,
                 )
             except VaultError:
                 pass
@@ -300,12 +323,27 @@ class VaultController(QObject):
         if outcome.authenticated:
             self.decoy_mode = False
             self.state = STATE_UNLOCKED
-            self.vault.write_state(phase="unlocked") if self.vault else None
+            if self.vault is not None:
+                self.vault.write_state(phase="unlocked")
+                # файлы, спрятанные в буфер без ключа, дошифровываем сейчас
+                try:
+                    staged = self.vault.ingest_staged()
+                except VaultError:
+                    staged = 0
+                if staged:
+                    self.toast.emit(f"Дозашифровано файлов из буфера: {staged}", "ok")
             self.toast.emit("Доступ открыт", "ok")
         else:
-            # режим обманки: ведём себя так, будто пароль верный
+            # режим обманки: ведём себя так, будто пароль верный.
+            # Папки с приманками появляются именно сейчас — в заблокированном
+            # состоянии их на диске нет вообще.
             self.decoy_mode = True
             self.state = STATE_DECOY
+            if self.vault is not None:
+                try:
+                    self.vault.materialize_decoys_for_view()
+                except VaultError:
+                    pass
             self.toast.emit("Доступ открыт", "ok")
         self.state_changed.emit(self.state)
         self.folders_changed.emit()
@@ -315,10 +353,17 @@ class VaultController(QObject):
         if self._busy:
             return
         if self.decoy_mode:
-            # в сеансе обманки нечего шифровать — просто возвращаем экран пароля
+            # в сеансе обманки нечего шифровать — убираем приманки (и папки,
+            # если включено полное скрытие) и возвращаем экран пароля
             self.decoy_mode = False
             self.state = STATE_LOCKED
             if self.vault is not None:
+                try:
+                    self.vault.clear_decoy_folders(
+                        remove_folders=self.settings.hide_folders_when_locked
+                    )
+                except VaultError:
+                    pass
                 self.vault.forget_keys()
             self.state_changed.emit(self.state)
             self.folders_changed.emit()
@@ -337,8 +382,12 @@ class VaultController(QObject):
                 purge_traces=s.purge_traces,
                 verify_deep=s.deep_verify,
                 wipe_passes=s.wipe_passes,
+                keep_folder_visible=not s.hide_folders_when_locked,
             )
-            vault.forget_keys()
+            # при мгновенной защите ключ остаётся в памяти наблюдателя,
+            # иначе забываем его полностью
+            if not s.instant_protection:
+                vault.forget_keys()
             return count
 
         self._run(
@@ -382,6 +431,7 @@ class VaultController(QObject):
                 purge_traces=s.purge_traces,
                 verify_deep=s.deep_verify,
                 wipe_passes=s.wipe_passes,
+                keep_folder_visible=not s.hide_folders_when_locked,
             )
             return rec.path
 
@@ -419,6 +469,7 @@ class VaultController(QObject):
                     progress,
                     verify_deep=s.deep_verify,
                     wipe_passes=s.wipe_passes,
+                    keep_folder_visible=not s.hide_folders_when_locked,
                 )
                 if s.purge_traces:
                     vault.purge_traces()
@@ -681,6 +732,8 @@ class VaultController(QObject):
         on_fail: Callable[[Exception], None] | None = None,
         silent: bool = False,
     ) -> None:
+        if self._stopping:
+            return  # приложение закрывается — фоновые задачи уже не запускаем
         if self._busy:
             self.toast.emit("Дождитесь окончания текущей операции", "warn")
             return
@@ -723,6 +776,117 @@ class VaultController(QObject):
 
     def _tick(self) -> None:
         self.folders_changed.emit()
+
+    # ==================================================================== #
+    # Наблюдатель: новые файлы в защищённых папках прячутся сразу
+    # ==================================================================== #
+
+    def _watch_paths(self) -> list[tuple[str, str]]:
+        """(путь, id папки) — доступно и без пароля (через витрину обманок)."""
+        if self.vault is None:
+            return []
+        if self.vault.unlocked:
+            try:
+                return [(r.path, r.id) for r in self.vault.manifest.folders]
+            except VaultError:
+                return []
+        return [(d.path, d.folder_id) for d in self.vault.decoy_view.load() if d.folder_id]
+
+    def _watch_tick(self) -> None:
+        """Раз в 2 секунды смотрим защищённые папки в ЗАКРЫТОМ состоянии.
+
+        Пока сейф открыт, файлы трогать нельзя — пользователь с ними работает.
+        Файл считается «новым», когда его размер стабилен между двумя тиками
+        (копирование ещё идёт — не трогаем).
+        """
+        if self._stopping or self._busy or self.decoy_mode or self.vault is None:
+            self._watch_seen.clear()
+            return
+        if self.state != STATE_LOCKED:
+            self._watch_seen.clear()
+            return
+
+        current: dict[str, dict[str, tuple[int, str, Path]]] = {}
+        for path, folder_id in self._watch_paths():
+            root = Path(path)
+            if not root.is_dir():
+                continue
+            placed = self.vault.decoys.placed_rels(path)
+            try:
+                walk = walk_tree(root)
+            except OSError:
+                continue
+            if not walk.ok:
+                continue
+            for item in walk.files:
+                if item.rel in placed:
+                    continue
+                current.setdefault(path, {})[item.rel] = (item.size, folder_id, item.path)
+
+        stable: list[tuple[str, str, Path]] = []
+        seen_next: dict[str, dict[str, int]] = {}
+        for path, rels in current.items():
+            prev = self._watch_seen.get(path, {})
+            keep: dict[str, int] = {}
+            for rel, (size, folder_id, p) in rels.items():
+                if prev.get(rel) == size:
+                    stable.append((folder_id, rel, p))
+                else:
+                    keep[rel] = size
+            seen_next[path] = keep
+        self._watch_seen = seen_next
+        if not stable:
+            return
+
+        by_folder: dict[str, list[Path]] = {}
+        for folder_id, _rel, p in stable:
+            by_folder.setdefault(folder_id, []).append(p)
+        self._hide_new_files(by_folder)
+
+    def _hide_new_files(self, by_folder: dict[str, list[Path]]) -> None:
+        vault = self.vault
+        if vault is None or not by_folder:
+            return
+        s = self.settings
+
+        if vault.unlocked:
+            # мгновенная защита: ключ в памяти, шифруем прямо сейчас
+            def task(progress: Callable[[int, int, str], None]) -> int:
+                total = 0
+                for folder_id in by_folder:
+                    total += vault.ingest_changes(
+                        folder_id,
+                        progress,
+                        keep_folder_visible=not s.hide_folders_when_locked,
+                        purge_traces=s.purge_traces,
+                        verify_deep=s.deep_verify,
+                        wipe_passes=s.wipe_passes,
+                    )
+                return total
+
+            self._run(
+                task,
+                "Прячем новые файлы…",
+                on_ok=lambda n: self.toast.emit(f"Новых файлов спрятано: {n}", "ok") if n else None,
+            )
+        else:
+            # ключа в памяти нет: файл сразу уносится в скрытый буфер,
+            # а шифруется в блобы при следующем открытии сейфа
+            def task(progress: Callable[[int, int, str], None]) -> int:
+                moved = 0
+                for folder_id, paths in by_folder.items():
+                    moved += vault.stage_new_files(folder_id, paths)
+                return moved
+
+            self._run(
+                task,
+                "Убираем файлы в сейф…",
+                on_ok=lambda n: self.toast.emit(
+                    f"Файлов убрано в сейф: {n} — зашифруются при открытии", "ok"
+                )
+                if n
+                else None,
+            )
 
     def _check_autolock(self) -> None:
         minutes = int(self.settings.auto_lock_minutes or 0)

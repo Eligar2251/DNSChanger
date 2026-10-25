@@ -21,7 +21,7 @@ import struct
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 from . import blob as blobmod
 from . import crypto
@@ -484,6 +484,7 @@ class Vault:
         purge_traces: bool = True,
         verify_deep: bool = True,
         wipe_passes: int = 1,
+        keep_folder_visible: bool = True,
     ) -> FolderRecord:
         """Берёт папку под защиту: шифрует, проверяет, стирает оригиналы, кладёт приманки."""
         self._require_unlocked()
@@ -500,7 +501,13 @@ class Vault:
             locked=False,
         )
         self._manifest.folders.append(rec)
-        self._ingest(rec, progress=progress, verify_deep=verify_deep, wipe_passes=wipe_passes)
+        self._ingest(
+            rec,
+            progress=progress,
+            verify_deep=verify_deep,
+            wipe_passes=wipe_passes,
+            keep_folder_visible=keep_folder_visible,
+        )
         self._save_manifest()
         self._update_decoy_view()
         if purge_traces:
@@ -542,6 +549,7 @@ class Vault:
         purge_traces: bool = True,
         verify_deep: bool = True,
         wipe_passes: int = 1,
+        keep_folder_visible: bool = True,
     ) -> int:
         self._require_unlocked()
         todo = [f for f in list(self.manifest.folders) if not f.locked]
@@ -549,7 +557,13 @@ class Vault:
         done = 0
         for rec in todo:
             sub: Progress = lambda d, t, m, _done=done: progress(_done + d, total_files, m)  # noqa: E731
-            self._ingest(rec, progress=sub, verify_deep=verify_deep, wipe_passes=wipe_passes)
+            self._ingest(
+                rec,
+                progress=sub,
+                verify_deep=verify_deep,
+                wipe_passes=wipe_passes,
+                keep_folder_visible=keep_folder_visible,
+            )
             done += max(rec.file_count, 1)
             self._save_manifest()
         if purge_traces and todo:
@@ -580,6 +594,33 @@ class Vault:
         self._save_manifest()
         self._update_decoy_view()
 
+    def ingest_changes(self, folder_id: str, progress: Progress = _noop, **kwargs) -> int:
+        """Дошифровать новые/изменённые файлы уже защищённой папки.
+
+        Используется наблюдателем: пользователь бросил файл в папку —
+        его нужно спрятать немедленно, не дожидаясь ручной блокировки.
+        Возвращает число файлов, которые были зашифрованы в этот проход.
+        """
+        rec = self.manifest.find(folder_id)
+        if rec is None:
+            raise FolderError("папка не найдена")
+        root = Path(rec.path)
+        if not root.exists():
+            return 0
+        known = {f.rel for f in rec.files}
+        walk = walk_tree(root)
+        fresh = [f for f in walk.files if f.rel not in known]
+        if not fresh and walk.ok:
+            return 0
+        if not walk.ok:
+            # что-то не читается — не трогаем, наблюдатель попробует позже
+            return 0
+        before = rec.file_count
+        self._ingest(rec, progress=progress, **kwargs)
+        self._save_manifest()
+        self._update_decoy_view()
+        return rec.file_count - before
+
     def unlock_folder(self, folder_id: str, progress: Progress = _noop, *, verify: bool = True) -> None:
         rec = self.manifest.find(folder_id)
         if rec is None:
@@ -601,8 +642,13 @@ class Vault:
         verify_deep: bool = True,
         wipe_passes: int = 1,
         purge_traces: bool = False,
+        keep_folder_visible: bool = True,
     ) -> None:
-        """Папка → блобы. Оригиналы стираются только после полной проверки."""
+        """Папка → блобы. Оригиналы стираются только после полной проверки.
+
+        keep_folder_visible=False — папка убирается с диска целиком:
+        ни проводник, ни диалог «добавить файл» в браузере её не увидят.
+        """
         ensure_dir(self.blobs_dir)
         root = Path(rec.path)
         if not root.exists():
@@ -689,7 +735,7 @@ class Vault:
         new_blobs = {f.blob for f in entries}
         stale = old_blobs - new_blobs
 
-        removed = secure_delete_tree(root, passes=wipe_passes, keep_root=True)
+        removed = secure_delete_tree(root, passes=wipe_passes, keep_root=keep_folder_visible)
         rec.files = entries
         rec.dirs = [DirEntry(rel=d.rel, mtime_ns=d.mtime_ns, attrs=d.attrs) for d in walk.dirs]
         rec.locked = True
@@ -697,7 +743,8 @@ class Vault:
         for blob_id in stale:
             robust_unlink(self.blobs_dir / f"{blob_id}.vkb")
 
-        self.decoys.materialize(root)
+        if keep_folder_visible:
+            self.decoys.materialize(root)
         set_hidden_system(self.blobs_dir, True)
         self._journal(op="ingest", folder_id=rec.id, phase="done", path=rec.path, wiped=removed)
         self._clear_journal()
@@ -776,9 +823,149 @@ class Vault:
                     files=rec.file_count,
                     size=rec.total_size,
                     note=rec.note,
+                    folder_id=rec.id,
                 )
             )
         self.decoy_view.save(view)
+
+    def materialize_decoys_for_view(self) -> int:
+        """Сеанс обманки: создаёт папки и раскладывает в них приманки.
+
+        Нужен, когда при блокировке папки убираются полностью: без пароля
+        их не видно нигде, а на время «неверного» сеанса они появляются.
+        """
+        count = 0
+        for d in self.decoy_view.load():
+            try:
+                ensure_dir(d.path)
+                self.decoys.materialize(d.path)
+                count += 1
+            except OSError:
+                continue
+        return count
+
+    def clear_decoy_folders(self, remove_folders: bool = True) -> int:
+        """Убирает приманки после сеанса обманки; по желанию — и сами папки."""
+        removed = 0
+        for d in self.decoy_view.load():
+            root = Path(d.path)
+            try:
+                self.decoys.clear(root)
+            except OSError:
+                continue
+            if remove_folders and root.is_dir():
+                try:
+                    if not any(root.iterdir()):
+                        root.rmdir()
+                        removed += 1
+                except OSError:
+                    pass
+        return removed
+
+    # ==================================================================== #
+    # Скрытый буфер: спрятать файл немедленно, даже без ключа в памяти
+    # ==================================================================== #
+
+    @property
+    def stage_dir(self) -> Path:
+        return self.root / "stage"
+
+    def _stage_meta(self) -> Path:
+        return self.stage_dir / "index.json"
+
+    def _load_stage(self) -> list[dict]:
+        p = self._stage_meta()
+        if not p.exists():
+            return []
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except (OSError, ValueError):
+            return []
+
+    def _save_stage(self, items: list[dict]) -> None:
+        ensure_dir(self.stage_dir)
+        atomic_write_bytes(self._stage_meta(), json.dumps(items, ensure_ascii=False).encode("utf-8"))
+        set_hidden_system(self.stage_dir, True)
+
+    def stage_new_files(self, folder_id: str, paths: Iterable[Path | str]) -> int:
+        """Мгновенно убирает файлы из папки в скрытый буфер хранилища.
+
+        Используется, когда мастер-ключ не держится в памяти: файл исчезает
+        из папки сразу, а шифруется в блобы при следующем открытии сейфа.
+        """
+        items = self._load_stage()
+        ensure_dir(self.stage_dir)
+        moved = 0
+        for src in paths:
+            src = Path(src)
+            if not src.is_file():
+                continue
+            staged = f"{crypto.short_id(8)}_{src.name}"
+            dst = self.stage_dir / staged
+            try:
+                robust_replace(src, dst)
+            except OSError:
+                try:  # другой том: копируем и стираем оригинал
+                    shutil.copy2(src, dst)
+                    secure_delete_file(src)
+                except OSError:
+                    continue
+            items.append(
+                {
+                    "folder_id": folder_id,
+                    "rel": src.name,
+                    "staged": staged,
+                    "at": time.time(),
+                }
+            )
+            moved += 1
+        if moved:
+            self._save_stage(items)
+        return moved
+
+    def ingest_staged(self, progress: Progress = _noop) -> int:
+        """Зашифровать содержимое буфера в блобы (сразу после разблокировки)."""
+        self._require_unlocked()
+        items = self._load_stage()
+        if not items:
+            return 0
+        total = len(items)
+        done = 0
+        for index, item in enumerate(items):
+            progress(index, total, str(item.get("rel", "")))
+            rec = self.manifest.find(str(item.get("folder_id", "")))
+            src = self.stage_dir / str(item.get("staged", ""))
+            if rec is None or not src.exists():
+                continue
+            blob_id = crypto.short_id(16)
+            dst = self.blobs_dir / f"{blob_id}.vkb"
+            info = blobmod.encrypt_file(src, dst, self._blob_key(blob_id))
+            mtime = src.stat().st_mtime_ns
+            rec.files.append(
+                FileEntry(
+                    rel=str(item.get("rel", src.name)),
+                    blob=blob_id,
+                    size=info.size,
+                    sha256=info.sha256,
+                    mtime_ns=mtime,
+                )
+            )
+            robust_unlink(src)
+            done += 1
+        self._save_stage([])
+        robust_unlink(self._stage_meta())
+        try:
+            self.stage_dir.rmdir()
+        except OSError:
+            pass
+        self._save_manifest()
+        self._update_decoy_view()
+        progress(total, total, "готово")
+        return done
+
+    def staged_count(self) -> int:
+        return len(self._load_stage())
 
     # ==================================================================== #
     # Следы

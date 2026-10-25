@@ -240,6 +240,16 @@ class DecoyStore:
     def placed_targets(self) -> list[str]:
         return [r["target"] for r in self._load_placed()]
 
+    def placed_rels(self, target_dir: Path | str) -> set[str]:
+        """Относительные пути приманок, которые мы положили в эту папку."""
+        target = normalize(target_dir)
+        out: set[str] = set()
+        for rec in self._load_placed():
+            if same_path(rec.get("target", ""), target):
+                for f in rec.get("files", []):
+                    out.add(str(f.get("rel", "")))
+        return out
+
     def _save_placed(self, record: PlacedRecord) -> None:
         records = [r for r in self._load_placed() if not same_path(r["target"], record.target)]
         records.append(
@@ -286,6 +296,7 @@ class DecoyViewFolder:
     files: int = 0
     size: int = 0
     note: str = ""
+    folder_id: str = ""  # нужен наблюдателю и буферу, секретом не является
 
     @property
     def human_size(self) -> str:
@@ -296,7 +307,14 @@ class DecoyViewFolder:
         return display_path(self.path)
 
     def to_dict(self) -> dict:
-        return {"path": self.path, "name": self.name, "files": self.files, "size": self.size, "note": self.note}
+        return {
+            "path": self.path,
+            "name": self.name,
+            "files": self.files,
+            "size": self.size,
+            "note": self.note,
+            "folder_id": self.folder_id,
+        }
 
     @classmethod
     def from_dict(cls, d: dict) -> "DecoyViewFolder":
@@ -306,6 +324,7 @@ class DecoyViewFolder:
             files=int(d.get("files", 0)),
             size=int(d.get("size", 0)),
             note=str(d.get("note", "")),
+            folder_id=str(d.get("folder_id", "")),
         )
 
 
